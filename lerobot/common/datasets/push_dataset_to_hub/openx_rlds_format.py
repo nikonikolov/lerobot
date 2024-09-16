@@ -225,7 +225,7 @@ def load_from_raw(
 
         # If lang_key is present, convert the entire tensor at once
         if lang_key is not None:
-            langs = [str(x) for x in episode[lang_key]]
+            langs = [str(x.numpy().decode()) for x in episode[lang_key]]
 
         for im_key in image_keys:
             imgs = episode["observation"][im_key]
