@@ -265,8 +265,13 @@ def load_from_raw(
         if lang_key is not None:
             ep_dict["language_instruction"] = langs
 
+        translations, rotations, grippers = torch.split(actions, [3, 3, 1], dim=-1)
+
         ep_dict["observation.state"] = states
-        ep_dict["action"] = actions
+        # ep_dict["action"] = actions
+        ep_dict["control.translation"] = translations
+        ep_dict["control.rotation"] = rotations
+        ep_dict["control.gripper"] = grippers
         ep_dict["timestamp"] = torch.arange(0, num_frames, 1) / fps
         ep_dict["episode_index"] = torch.tensor([ep_idx] * num_frames)
         ep_dict["frame_index"] = torch.arange(0, num_frames, 1)
@@ -311,8 +316,17 @@ def to_hf_dataset(data_dict, video) -> Dataset:
     if "language_instruction" in data_dict:
         features["language_instruction"] = Value(dtype="string", id=None)
 
-    features["action"] = Sequence(
-        length=data_dict["action"].shape[1], feature=Value(dtype="float32", id=None)
+    # features["action"] = Sequence(
+    #     length=data_dict["action"].shape[1], feature=Value(dtype="float32", id=None)
+    # )
+    features["control.translation"] = Sequence(
+        length=data_dict["control.translation"].shape[1], feature=Value(dtype="float32", id=None)
+    )
+    features["control.rotation"] = Sequence(
+        length=data_dict["control.rotation"].shape[1], feature=Value(dtype="float32", id=None)
+    )
+    features["control.gripper"] = Sequence(
+        length=data_dict["control.gripper"].shape[1], feature=Value(dtype="float32", id=None)
     )
     features["episode_index"] = Value(dtype="int64", id=None)
     features["frame_index"] = Value(dtype="int64", id=None)
