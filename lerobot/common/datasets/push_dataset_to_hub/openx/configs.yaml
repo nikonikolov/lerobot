@@ -29,6 +29,19 @@ OPENX_DATASET_CONFIGS:
       - gripper_state
     fps: 5
 
+  bridge_orig:
+    image_obs_keys:
+      - image_0
+      - image_1
+      - image_2
+      - image_3
+    depth_obs_keys:
+      - null
+    state_obs_keys:
+      - EEF_state
+      - gripper_state
+    fps: 5
+
   taco_play:
     image_obs_keys:
       - rgb_static

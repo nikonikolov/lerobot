@@ -155,6 +155,9 @@ def push_dataset_to_hub(
     cache_dir: Path = Path("/tmp"),
     tests_data_dir: Path | None = None,
     encoding: dict | None = None,
+    pool_workers: int = 32,
+    episodes_per_shard: int = 256,
+    split: str = 'train',
 ):
     check_repo_id(repo_id)
     user_id, dataset_id = repo_id.split("/")
@@ -207,6 +210,9 @@ def push_dataset_to_hub(
         "video": video,
         "episodes": episodes,
         "encoding": encoding,
+        "num_workers": pool_workers,
+        "episodes_per_shard": episodes_per_shard,
+        "split": split,
     }
 
     if "openx_rlds." in raw_format:
@@ -226,13 +232,14 @@ def push_dataset_to_hub(
         info=info,
         videos_dir=videos_dir,
     )
-    stats = compute_stats(lerobot_dataset, batch_size, num_workers)
+    stats = None
 
     if local_dir:
         hf_dataset = hf_dataset.with_format(None)  # to remove transforms that cant be saved
-        hf_dataset.save_to_disk(str(local_dir / "train"))
+        hf_dataset.save_to_disk(str(local_dir / split))
 
-    if push_to_hub or local_dir:
+    if push_to_hub or local_dir and split == 'train':
+        stats = compute_stats(lerobot_dataset, batch_size, num_workers)
         # mandatory for upload
         save_meta_data(info, stats, episode_data_index, meta_data_dir)
 
@@ -244,7 +251,7 @@ def push_dataset_to_hub(
             push_videos_to_hub(repo_id, videos_dir, revision="main")
         create_branch(repo_id, repo_type="dataset", branch=CODEBASE_VERSION)
 
-    if tests_data_dir:
+    if tests_data_dir and stats is not None:
         # get the first episode
         num_items_first_ep = episode_data_index["to"][0] - episode_data_index["from"][0]
         test_hf_dataset = hf_dataset.select(range(num_items_first_ep))
@@ -268,6 +275,17 @@ def push_dataset_to_hub(
         # clear cache
         shutil.rmtree(meta_data_dir)
         shutil.rmtree(videos_dir)
+    else:
+        if (local_dir / 'ep_dicts').exists():
+            shutil.rmtree(local_dir / 'ep_dicts')
+        # if (local_dir / 'hf_tmp').exists():
+        #     try:
+        #         shutil.rmtree(local_dir / 'hf_tmp')
+        #     # This raises unexpected errors sometimes, so try a second time
+        #     except OSError:
+        #         import time
+        #         time.sleep(5)
+        #         shutil.rmtree(local_dir / 'hf_tmp')
 
     return lerobot_dataset
 
@@ -360,6 +378,24 @@ def main():
             "When provided, save tests artifacts into the given directory "
             "(e.g. `--tests-data-dir tests/data` will save to tests/data/{--repo-id})."
         ),
+    )
+    parser.add_argument(
+        "--pool-workers",
+        type=int,
+        default=32,
+        help="Number of processes for reading and converting TF dataset to HF dataset",
+    )
+    parser.add_argument(
+        "--episodes-per-shard",
+        type=int,
+        default=256,
+        help="Maximum number of episodes to keep in memory for each pool worker",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default='train',
+        help="Datast split. One of train or val",
     )
 
     args = parser.parse_args()
