@@ -27,347 +27,348 @@ Exact dataset fps defined in openx/config.py, obtained from:
     https://docs.google.com/spreadsheets/d/1rPBD77tk60AEIGZrGSODwyyzs5FgCU9Uz3h-3_t2A9g/edit?gid=0#gid=0&range=R:R
 """
 
-import shutil
-from pathlib import Path
+import math
+import functools
 
+import os
 import numpy as np
-import tensorflow as tf
 import tensorflow_datasets as tfds
 import torch
 import tqdm
-import yaml
-from datasets import Dataset, Features, Image, Sequence, Value
-from PIL import Image as PILImage
+import datasets
+import multiprocessing
+from typing import Any
 
 from lerobot.common.datasets.lerobot_dataset import CODEBASE_VERSION
-from lerobot.common.datasets.push_dataset_to_hub.openx.transforms import OPENX_STANDARDIZATION_TRANSFORMS
-from lerobot.common.datasets.push_dataset_to_hub.utils import (
-    concatenate_episodes,
-    get_default_encoding,
-    save_images_concurrently,
-)
+
 from lerobot.common.datasets.utils import (
     calculate_episode_data_index,
     hf_transform_to_torch,
 )
-from lerobot.common.datasets.video_utils import VideoFrame, encode_video_frames
 
-with open("lerobot/common/datasets/push_dataset_to_hub/openx/configs.yaml") as f:
-    _openx_list = yaml.safe_load(f)
-
-OPENX_DATASET_CONFIGS = _openx_list["OPENX_DATASET_CONFIGS"]
-
-np.set_printoptions(precision=2)
-
-
-def tf_to_torch(data):
-    return torch.from_numpy(data.numpy())
-
-
-def tf_img_convert(img):
-    if img.dtype == tf.string:
-        img = tf.io.decode_image(img, expand_animations=False, dtype=tf.uint8)
-    elif img.dtype != tf.uint8:
-        raise ValueError(f"Unsupported image dtype: found with dtype {img.dtype}")
-    return img.numpy()
-
-
-def _broadcast_metadata_rlds(i: tf.Tensor, traj: dict) -> dict:
-    """
-    In the RLDS format, each trajectory has some top-level metadata that is explicitly separated out, and a "steps"
-    entry. This function moves the "steps" entry to the top level, broadcasting any metadata to the length of the
-    trajectory. This function also adds the extra metadata fields `_len`, `_traj_index`, and `_frame_index`.
-
-    NOTE: adapted from DLimp library https://github.com/kvablack/dlimp/
-    """
-    steps = traj.pop("steps")
-
-    traj_len = tf.shape(tf.nest.flatten(steps)[0])[0]
-
-    # broadcast metadata to the length of the trajectory
-    metadata = tf.nest.map_structure(lambda x: tf.repeat(x, traj_len), traj)
-
-    # put steps back in
-    assert "traj_metadata" not in steps
-    traj = {**steps, "traj_metadata": metadata}
-
-    assert "_len" not in traj
-    assert "_traj_index" not in traj
-    assert "_frame_index" not in traj
-    traj["_len"] = tf.repeat(traj_len, traj_len)
-    traj["_traj_index"] = tf.repeat(i, traj_len)
-    traj["_frame_index"] = tf.range(traj_len)
-
-    return traj
-
-
-def load_from_raw(
-    raw_dir: Path,
-    videos_dir: Path,
-    fps: int,
-    video: bool,
-    episodes: list[int] | None = None,
-    encoding: dict | None = None,
-    openx_dataset_name: str | None = None,
-):
-    """
-    Args:
-        raw_dir (Path): _description_
-        videos_dir (Path): _description_
-        fps (int): _description_
-        video (bool): _description_
-        episodes (list[int] | None, optional): _description_. Defaults to None.
-    """
-    ds_builder = tfds.builder_from_directory(str(raw_dir))
-    dataset = ds_builder.as_dataset(
-        split="all",
-        decoders={"steps": tfds.decode.SkipDecoding()},
-    )
-
-    dataset_info = ds_builder.info
-    print("dataset_info: ", dataset_info)
-
-    ds_length = len(dataset)
-    dataset = dataset.take(ds_length)
-    # "flatten" the dataset as such we can apply trajectory level map() easily
-    # each [obs][key] has a shape of (frame_size, ...)
-    dataset = dataset.enumerate().map(_broadcast_metadata_rlds)
-
-    # we will apply the standardization transform if the dataset_name is provided
-    # if the dataset name is not provided and the goal is to convert any rlds formatted dataset
-    # search for 'image' keys in the observations
-    if openx_dataset_name is not None:
-        print(" - applying standardization transform for dataset: ", openx_dataset_name)
-        assert openx_dataset_name in OPENX_STANDARDIZATION_TRANSFORMS
-        transform_fn = OPENX_STANDARDIZATION_TRANSFORMS[openx_dataset_name]
-        dataset = dataset.map(transform_fn)
-
-        image_keys = OPENX_DATASET_CONFIGS[openx_dataset_name]["image_obs_keys"]
-    else:
-        obs_keys = dataset_info.features["steps"]["observation"].keys()
-        image_keys = [key for key in obs_keys if "image" in key]
-
-    lang_key = "language_instruction" if "language_instruction" in dataset.element_spec else None
-
-    print(" - image_keys: ", image_keys)
-    print(" - lang_key: ", lang_key)
-
-    it = iter(dataset)
-
-    ep_dicts = []
-    # Init temp path to save ep_dicts in case of crash
-    tmp_ep_dicts_dir = videos_dir.parent.joinpath("ep_dicts")
-    tmp_ep_dicts_dir.mkdir(parents=True, exist_ok=True)
-
-    # check if ep_dicts have already been saved in /tmp
-    starting_ep_idx = 0
-    saved_ep_dicts = [ep.__str__() for ep in tmp_ep_dicts_dir.iterdir()]
-    if len(saved_ep_dicts) > 0:
-        saved_ep_dicts.sort()
-        # get last ep_idx number
-        starting_ep_idx = int(saved_ep_dicts[-1][-13:-3]) + 1
-        for i in range(starting_ep_idx):
-            episode = next(it)
-            ep_dicts.append(torch.load(saved_ep_dicts[i]))
-
-    # if we user specified episodes, skip the ones not in the list
-    if episodes is not None:
-        if ds_length == 0:
-            raise ValueError("No episodes found.")
-        # convert episodes index to sorted list
-        episodes = sorted(episodes)
-
-    for ep_idx in tqdm.tqdm(range(starting_ep_idx, ds_length)):
-        episode = next(it)
-
-        # if user specified episodes, skip the ones not in the list
-        if episodes is not None:
-            if len(episodes) == 0:
-                break
-            if ep_idx == episodes[0]:
-                # process this episode
-                print(" selecting episode idx: ", ep_idx)
-                episodes.pop(0)
-            else:
-                continue  # skip
-
-        num_frames = episode["action"].shape[0]
-
-        ###########################################################
-        # Handle the episodic data
-
-        # last step of demonstration is considered done
-        done = torch.zeros(num_frames, dtype=torch.bool)
-        done[-1] = True
-        ep_dict = {}
-        langs = []  # TODO: might be located in "observation"
-
-        image_array_dict = {key: [] for key in image_keys}
-
-        # We will create the state observation tensor by stacking the state
-        # obs keys defined in the openx/configs.py
-        if openx_dataset_name is not None:
-            state_obs_keys = OPENX_DATASET_CONFIGS[openx_dataset_name]["state_obs_keys"]
-            # stack the state observations, if is None, pad with zeros
-            states = []
-            for key in state_obs_keys:
-                if key in episode["observation"]:
-                    states.append(tf_to_torch(episode["observation"][key]))
-                else:
-                    states.append(torch.zeros(num_frames, 1))  # pad with zeros
-            states = torch.cat(states, dim=1)
-            # assert states.shape == (num_frames, 8), f"states shape: {states.shape}"
-        else:
-            states = tf_to_torch(episode["observation"]["state"])
-
-        actions = tf_to_torch(episode["action"])
-        rewards = tf_to_torch(episode["reward"]).float()
-
-        # If lang_key is present, convert the entire tensor at once
-        if lang_key is not None:
-            langs = [str(x.numpy().decode()) for x in episode[lang_key]]
-
-        for im_key in image_keys:
-            imgs = episode["observation"][im_key]
-            image_array_dict[im_key] = [tf_img_convert(img) for img in imgs]
-
-        # simple assertions
-        for item in [states, actions, rewards, done]:
-            assert len(item) == num_frames
-
-        ###########################################################
-
-        # loop through all cameras
-        for im_key in image_keys:
-            img_key = f"observation.images.{im_key}"
-            imgs_array = image_array_dict[im_key]
-            imgs_array = np.array(imgs_array)
-            if video:
-                # save png images in temporary directory
-                tmp_imgs_dir = videos_dir / "tmp_images"
-                save_images_concurrently(imgs_array, tmp_imgs_dir)
-
-                # encode images to a mp4 video
-                fname = f"{img_key}_episode_{ep_idx:06d}.mp4"
-                video_path = videos_dir / fname
-                encode_video_frames(tmp_imgs_dir, video_path, fps, **(encoding or {}))
-
-                # clean temporary images directory
-                shutil.rmtree(tmp_imgs_dir)
-
-                # store the reference to the video frame
-                ep_dict[img_key] = [
-                    {"path": f"videos/{fname}", "timestamp": i / fps} for i in range(num_frames)
-                ]
-            else:
-                ep_dict[img_key] = [PILImage.fromarray(x) for x in imgs_array]
-
-        if lang_key is not None:
-            ep_dict["language_instruction"] = langs
-
-        translations, rotations, grippers = torch.split(actions, [3, 3, 1], dim=-1)
-
-        ep_dict["observation.state"] = states
-        # ep_dict["action"] = actions
-        ep_dict["control.translation"] = translations
-        ep_dict["control.rotation"] = rotations
-        ep_dict["control.gripper"] = grippers
-        ep_dict["timestamp"] = torch.arange(0, num_frames, 1) / fps
-        ep_dict["episode_index"] = torch.tensor([ep_idx] * num_frames)
-        ep_dict["frame_index"] = torch.arange(0, num_frames, 1)
-        ep_dict["next.reward"] = rewards
-        ep_dict["next.done"] = done
-
-        path_ep_dict = tmp_ep_dicts_dir.joinpath(
-            "ep_dict_" + "0" * (10 - len(str(ep_idx))) + str(ep_idx) + ".pt"
-        )
-        torch.save(ep_dict, path_ep_dict)
-
-        ep_dicts.append(ep_dict)
-
-    data_dict = concatenate_episodes(ep_dicts)
-
-    total_frames = data_dict["frame_index"].shape[0]
-    data_dict["index"] = torch.arange(0, total_frames, 1)
-    return data_dict
-
-
-def to_hf_dataset(data_dict, video) -> Dataset:
-    features = {}
-
-    keys = [key for key in data_dict if "observation.images." in key]
-    for key in keys:
-        if video:
-            features[key] = VideoFrame()
-        else:
-            features[key] = Image()
-
-    features["observation.state"] = Sequence(
-        length=data_dict["observation.state"].shape[1], feature=Value(dtype="float32", id=None)
-    )
-    if "observation.velocity" in data_dict:
-        features["observation.velocity"] = Sequence(
-            length=data_dict["observation.velocity"].shape[1], feature=Value(dtype="float32", id=None)
-        )
-    if "observation.effort" in data_dict:
-        features["observation.effort"] = Sequence(
-            length=data_dict["observation.effort"].shape[1], feature=Value(dtype="float32", id=None)
-        )
-    if "language_instruction" in data_dict:
-        features["language_instruction"] = Value(dtype="string", id=None)
-
-    # features["action"] = Sequence(
-    #     length=data_dict["action"].shape[1], feature=Value(dtype="float32", id=None)
-    # )
-    features["control.translation"] = Sequence(
-        length=data_dict["control.translation"].shape[1], feature=Value(dtype="float32", id=None)
-    )
-    features["control.rotation"] = Sequence(
-        length=data_dict["control.rotation"].shape[1], feature=Value(dtype="float32", id=None)
-    )
-    features["control.gripper"] = Sequence(
-        length=data_dict["control.gripper"].shape[1], feature=Value(dtype="float32", id=None)
-    )
-    features["episode_index"] = Value(dtype="int64", id=None)
-    features["frame_index"] = Value(dtype="int64", id=None)
-    features["timestamp"] = Value(dtype="float32", id=None)
-    features["next.reward"] = Value(dtype="float32", id=None)
-    features["next.done"] = Value(dtype="bool", id=None)
-    features["index"] = Value(dtype="int64", id=None)
-
-    hf_dataset = Dataset.from_dict(data_dict, features=Features(features))
-    hf_dataset.set_transform(hf_transform_to_torch)
-    return hf_dataset
+from lerobot.common.datasets.push_dataset_to_hub.openx.openx_utils import (
+    OPENX_DATASET_CONFIGS,
+    make_tf_dataset,
+    verify_hf_dataset_correctness,
+    shard_index_to_name,
+    extract_episode_data,
+    extract_episode_metadata,
+    ep_dict_to_hf_dataset,
+    metadata_dict_to_hf_dataset,
+)
 
 
 def from_raw_to_lerobot_format(
-    raw_dir: Path,
-    videos_dir: Path,
-    fps: int | None = None,
-    video: bool = True,
-    episodes: list[int] | None = None,
-    encoding: dict | None = None,
-    openx_dataset_name: str | None = None,
+    source_path: str,
+    output_path: str,
+    dataset_name: str,
+    episodes_per_shard: int = 256,
+    num_workers: int = 32,
+    split: str = 'train',
 ):
-    """This is a test impl for rlds conversion"""
-    if openx_dataset_name is None:
-        # set a default rlds frame rate if the dataset is not from openx
-        fps = 30
-    elif "fps" not in OPENX_DATASET_CONFIGS[openx_dataset_name]:
+    if "fps" not in OPENX_DATASET_CONFIGS[dataset_name]:
         raise ValueError(
             "fps for this dataset is not specified in openx/configs.py yet," "means it is not yet tested"
         )
-    fps = OPENX_DATASET_CONFIGS[openx_dataset_name]["fps"]
+    fps = OPENX_DATASET_CONFIGS[dataset_name]["fps"]
 
-    data_dict = load_from_raw(raw_dir, videos_dir, fps, video, episodes, encoding, openx_dataset_name)
-    hf_dataset = to_hf_dataset(data_dict, video)
+    hf_dataset, metadata_dataset = convert_rlds_to_hf_dataset(
+        source_path=source_path,
+        output_path=output_path,
+        dataset_name=dataset_name,
+        episodes_per_shard=episodes_per_shard,
+        num_workers=num_workers,
+        split=split,
+    )
+
+    if "index" in hf_dataset.column_names:
+        hf_dataset = hf_dataset.remove_columns("index")
+    hf_dataset = hf_dataset.add_column("index", np.arange(0, len(hf_dataset), 1))
+
+    hf_dataset.set_transform(hf_transform_to_torch)
+
     episode_data_index = calculate_episode_data_index(hf_dataset)
     info = {
         "codebase_version": CODEBASE_VERSION,
         "fps": fps,
-        "video": video,
+        "video": False,
     }
-    if video:
-        info["encoding"] = get_default_encoding()
 
-    return hf_dataset, episode_data_index, info
+    return hf_dataset, metadata_dataset, episode_data_index, info
+
+
+def convert_rlds_to_hf_dataset(
+    source_path: str,
+    output_path: str,
+    dataset_name: str,
+    episodes_per_shard: int = 16,
+    num_workers: int = 32,
+    split: str = 'train',
+):
+    ds_builder = tfds.builder_from_directory(source_path)
+
+    if split == 'test' and 'val' in ds_builder.info.splits:
+        split = 'val'
+
+    dataset_info = ds_builder.info    
+    ds_length = ds_builder.info.splits[split].num_examples
+
+    print("dataset_info: ", dataset_info)
+    print("num episodes: ", ds_length)
+
+    tmp_shards_dir = os.path.join(output_path, 'tmp_hf_shards')  # Stores shards
+    tmp_metadata_dir = os.path.join(output_path, 'tmp_hf_metadata')  # Stores episode metadata
+ 
+    os.makedirs(tmp_shards_dir, exist_ok=True)
+    os.makedirs(tmp_metadata_dir, exist_ok=True)
+
+    # Use for debugging or when the dataset is very small and saving shards to disk will slow things down
+    if num_workers == 0:
+        hf_dataset, metadata_dataset = episodes_to_hf_dataset_shard(
+            start_idx=0,
+            end_idx=ds_length,
+            dataset_output_path=None,
+            metadata_output_path=None,
+            dataset_name=dataset_name,
+            source_path=source_path,
+            split=split,
+            save=False, 
+        )
+    
+    else:
+        config = make_mp_processing_configuration(
+            source_path=source_path,
+            dataset_name=dataset_name,
+            episodes_per_shard=episodes_per_shard,
+            num_workers=num_workers,
+            ds_length=ds_length,
+            output_path=output_path,
+            split=split,
+        )
+        start_indices = config['start_indices']
+        end_indices = config['end_indices']
+        shard_paths = config['shard_paths']
+        metadata_shard_paths = config['metadata_shard_paths']
+
+        with multiprocessing.Pool(num_workers, maxtasksperchild=1) as pool:
+            pool.starmap(
+                functools.partial(
+                    episodes_to_hf_dataset_shard,
+                    dataset_name=dataset_name,
+                    source_path=source_path,
+                    split=split,
+                    save=True,
+                ),
+                list(zip(start_indices, end_indices, shard_paths, metadata_shard_paths))
+            )
+
+        data_shard_paths = [
+            os.path.join(tmp_shards_dir, shard_name) for shard_name in sorted(os.listdir(tmp_shards_dir))
+        ]
+        metadata_shard_paths = [
+            os.path.join(tmp_metadata_dir, metadata_name) for metadata_name in sorted(os.listdir(tmp_metadata_dir))
+        ]
+
+        # Load and concatenate all shards and all metadata
+        print("Loading datasets from disk")
+        hf_dataset = datasets.concatenate_datasets(
+            [datasets.Dataset.load_from_disk(tmp_path) for tmp_path in data_shard_paths]
+        )
+        metadata_dataset = datasets.concatenate_datasets(
+            [datasets.Dataset.load_from_disk(tmp_path) for tmp_path in metadata_shard_paths]
+        )
+
+    verify_hf_dataset_correctness(
+        hf_dataset, metadata_dataset, dataset_name=dataset_name, source_path=source_path, split=split
+    )
+
+    print("HF dataset created")
+
+    return hf_dataset, metadata_dataset
+
+
+def episodes_to_hf_dataset_shard(
+    start_idx: int,
+    end_idx: int,
+    dataset_output_path: str,
+    metadata_output_path: str,
+    dataset_name: str,
+    source_path: str,
+    split: str,
+    save: bool = True,
+):
+    fps = OPENX_DATASET_CONFIGS[dataset_name]["fps"]
+
+    tf_dataset = make_tf_dataset(source_path, dataset_name, split=split)
+
+    # Cut the dataset to the specified shard
+    tf_dataset = tf_dataset.skip(start_idx).take(end_idx - start_idx)
+    assert len(tf_dataset) == end_idx - start_idx, f"{len(tf_dataset)} != {end_idx - start_idx}"
+
+    it = iter(tf_dataset)
+    hf_datasets: list[datasets.Dataset] = []
+    metadata_datasets: list[datasets.Dataset] = []
+
+    tf_image_keys = OPENX_DATASET_CONFIGS[dataset_name]["image_obs_keys"]
+    tf_depth_keys = OPENX_DATASET_CONFIGS[dataset_name]["depth_obs_keys"]
+    # tf_state_obs_keys = OPENX_DATASET_CONFIGS[dataset_name]["state_obs_keys"]
+
+    for ep_idx in tqdm.tqdm(range(start_idx, end_idx)):
+        episode = next(it)
+
+        num_frames = episode["action"].shape[0]
+
+        ep_dict = extract_episode_data(
+            episode,
+            tf_image_keys=tf_image_keys,
+            tf_depth_keys=tf_depth_keys,
+            element_spec=tf_dataset.element_spec,
+            skip_imgs=False,
+        )
+
+        metadata: dict[str, Any] = extract_episode_metadata(episode, ep_idx)
+
+        # Make sure all entries are of the same length
+        assert len(set([len(v) for v in ep_dict.values()] + [num_frames])) == 1
+
+        # Add extra information for each transition
+        ep_dict["timestamp"] = torch.arange(0, num_frames, 1) / fps
+        ep_dict["episode_index"] = torch.tensor([ep_idx] * num_frames)
+        ep_dict["frame_index"] = torch.arange(0, num_frames, 1)
+        ep_dict['index'] = torch.arange(num_frames)
+
+        # Convert to hf dataset - takes significantly less memory
+        hf_dataset = ep_dict_to_hf_dataset(ep_dict, element_spec=tf_dataset.element_spec)
+        metadata_dataset = metadata_dict_to_hf_dataset(metadata, element_spec=tf_dataset.element_spec)
+
+        hf_datasets.append(hf_dataset)
+        metadata_datasets.append(metadata_dataset)
+
+    hf_dataset = datasets.concatenate_datasets(hf_datasets)
+    metadata_dataset = datasets.concatenate_datasets(metadata_datasets)
+
+    if save:
+        hf_dataset.save_to_disk(dataset_output_path)
+        metadata_dataset.save_to_disk(metadata_output_path)
+        return None, None
+    return hf_dataset, metadata_dataset
+
+
+def make_mp_processing_configuration(
+    source_path: str,
+    dataset_name: str,
+    episodes_per_shard: int,
+    num_workers: int,
+    ds_length: int,
+    output_path: str,
+    split: str,
+) -> dict[str, list[Any]]:
+    """
+    Get the configuration for processing the dataset - how to split into shards and which shards remain
+    to be processed. Supports continuing from a previous run
+    """
+
+    tmp_shards_dir = os.path.join(output_path, 'tmp_hf_shards')  # Stores shards
+    tmp_metadata_dir = os.path.join(output_path, 'tmp_hf_metadata')  # Stores episode metadata
+
+    # See if anything has already been processed
+    processed_shards_indices: list[int] = [
+        int(filename.replace('shard_', '')) for filename in os.listdir(tmp_shards_dir)
+    ]
+
+    if len(processed_shards_indices) > 0:
+        # Find episodes_per_shard for the shards already written
+        tmp_dataset = datasets.Dataset.load_from_disk(
+            os.path.join(tmp_shards_dir, os.listdir(tmp_shards_dir)[0])
+        )
+        written_episodes_per_shard = len(np.unique(tmp_dataset['episode_index']))
+
+        last_shard = max(processed_shards_indices) + 1  # Exclusive
+        last_episode = last_shard * written_episodes_per_shard
+
+        missing_shard_indices: list[int] = [
+            i for i in range(max(processed_shards_indices)) if i not in processed_shards_indices
+        ]
+
+        # Everything was already processed
+        if len(missing_shard_indices) == 0 and last_episode >= ds_length:
+            return {
+                'start_indices': [],
+                'end_indices': [],
+                'source_paths': [],
+                'names': [],
+                'splits': [],
+                'metadata_shard_paths': [],
+                'shard_paths': [],
+            }
+
+        # Get start and end indices for missing shards. Use written_episodes_per_shard
+        missing_start_indices = [
+            shard * written_episodes_per_shard for shard in missing_shard_indices
+        ]
+        missing_end_indices = [
+            (shard + 1) * written_episodes_per_shard for shard in missing_shard_indices
+        ]
+
+        # Get indices for remaining shard beyond the max written shard
+        split_indices = np.arange(last_episode, ds_length, episodes_per_shard)
+        if len(split_indices) > 0:
+            if ds_length > split_indices[-1]:
+                split_indices = split_indices.tolist() + [ds_length]
+            else:
+                split_indices = split_indices.tolist()
+
+            beyond_start_indices = split_indices[:-1]
+            beyond_end_indices = split_indices[1:]
+            num_shards_beyond = len(start_indices)
+        else:
+            beyond_start_indices = []
+            beyond_end_indices = []
+            num_shards_beyond = 0
+        
+        # Combine missing and beyond indices
+        start_indices = missing_start_indices + beyond_start_indices
+        end_indices = missing_end_indices + beyond_end_indices
+
+        # Get the shards that still need to be processed
+        shard_indices = missing_shard_indices + (np.arange(num_shards_beyond) + last_shard).tolist()
+        shard_paths = [
+            os.path.join(tmp_shards_dir, shard_index_to_name(shard)) for shard in shard_indices
+        ]
+        metadata_paths = [
+            os.path.join(tmp_metadata_dir, shard_index_to_name(shard)) for shard in shard_indices
+        ]
+        num_shards = len(shard_paths)
+
+    else:
+        episodes_per_shard = min(episodes_per_shard, math.ceil(ds_length / num_workers))
+
+        split_indices = np.arange(0, ds_length // episodes_per_shard + 1) * episodes_per_shard
+        if ds_length % episodes_per_shard != 0:
+            split_indices = split_indices.tolist() + [ds_length]
+        else:
+            split_indices = split_indices.tolist()
+
+        start_indices, end_indices = split_indices[:-1], split_indices[1:]
+        num_shards = len(start_indices)
+
+        shard_paths = [
+            os.path.join(tmp_shards_dir, shard_index_to_name(shard)) for shard in range(num_shards)
+        ]
+        metadata_paths = [
+            os.path.join(tmp_metadata_dir, shard_index_to_name(shard)) for shard in range(num_shards)
+        ]
+
+    names = [dataset_name] * num_shards
+    source_paths = [source_path] * num_shards
+    splits = [split] * num_shards
+
+    return {
+        'start_indices': start_indices,
+        'end_indices': end_indices,
+        'source_paths': source_paths,
+        'names': names,
+        'splits': splits,
+        'shard_paths': shard_paths,
+        'metadata_shard_paths': metadata_paths,
+    }
